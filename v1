@@ -1,0 +1,129 @@
+import asyncio
+import ccxt.async_support as ccxt
+import logging
+from logging.handlers import RotatingFileHandler
+import datetime
+
+# 🔑 API klíče (bezpečné načtení)
+api_key = "atm6HtuAV0FGVAfdtwzBuujPBOXP6mlVYyLph8rg9VZ1LWLuNgyfC6auEixCgfBU"
+api_secret = "SWlmkswmxbM2JWBzYVVc7e515Vayoe9l1kCLex3C2sKR7ATmhGYqWvD3HKSSGglZ"
+
+# 📡 Inicializace Binance (sandbox mode)
+exchange = ccxt.binance({
+    "apiKey": api_key,
+    "secret": api_secret,
+    "enableRateLimit": True,
+    "options": {"defaultType": "spot"}
+})
+exchange.set_sandbox_mode(True)
+
+# 📝 Logovací systém
+def setup_logging():
+    logger = logging.getLogger("trader")
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler = RotatingFileHandler("trade_log.txt", maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+logger = setup_logging()
+
+# 🔹 Obchodní parametry
+symbol = "USDC/USDT"
+trade_cooldown = 1  # 1 sekunda mezi příkazy
+spread_threshold = 0.000005  # Nižší spread threshold pro agresivnější trading
+
+open_positions = []
+total_profit = 0
+last_trade_time = None
+executed_trades = 0  # Počet provedených obchodů
+
+# 📌 Ochrana proti chybám a rate-limitům
+async def safe_api_call(api_func, *args, **kwargs):
+    retries = 3
+    for attempt in range(retries):
+        try:
+            return await api_func(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            logger.warning(f"API Chyba ({attempt + 1}/{retries}): {e}")
+        await asyncio.sleep(2 ** attempt)
+    return None
+
+# 🔍 Získání nejlepšího bid/ask + analýza objemu
+async def get_best_bid_ask():
+    order_book = await safe_api_call(exchange.fetch_order_book, symbol)
+    if not order_book or not order_book['bids'] or not order_book['asks']:
+        return None, None, 0, 0
+    
+    best_bid = order_book['bids'][0][0]
+    best_ask = order_book['asks'][0][0]
+    return best_bid, best_ask
+
+# 🔄 Automatické načítání dat
+async def fetch_market_data():
+    balance = await safe_api_call(exchange.fetch_balance)
+    best_bid, best_ask = await get_best_bid_ask()
+    available_balance = balance["total"].get("USDT", 0) if balance else 0
+    return available_balance, best_bid, best_ask
+
+# 🔄 Market-Making Strategie s Fill or Kill
+async def execute_strategy():
+    global total_profit, last_trade_time, executed_trades
+    while True:
+        try:
+            available_balance, best_bid, best_ask = await fetch_market_data()
+            if best_bid is None or best_ask is None:
+                await asyncio.sleep(0.5)
+                continue
+            
+            spread = best_ask - best_bid
+            if spread < spread_threshold:
+                await asyncio.sleep(0.5)
+                continue
+            
+            current_time = datetime.datetime.now().timestamp()
+            if last_trade_time and (current_time - last_trade_time) < trade_cooldown:
+                await asyncio.sleep(0.5)
+                continue
+            
+            # Dynamická velikost obchodů podle dostupného kapitálu (5% kapitálu na obchod, min 1 USDC)
+            trade_size = max(available_balance * 0.05, 1)
+            
+            # 📈 Nákupní logika - Fill or Kill limitní příkaz na nejlepším bidu
+            if available_balance > trade_size:
+                buy_order = await safe_api_call(exchange.create_limit_buy_order, symbol, trade_size, best_bid, {'timeInForce': 'FOK'})
+                if buy_order:
+                    open_positions.append({"buy_price": best_bid, "amount": trade_size, "active": True})
+                    last_trade_time = current_time
+                    executed_trades += 1
+                    logger.info(f"Limitní nákup: {trade_size:.2f} USDC za {best_bid}")
+            
+            # 📉 Prodejní logika - Fill or Kill limitní příkaz na nejlepším asku
+            closed_positions = []
+            for position in open_positions:
+                sell_order = await safe_api_call(exchange.create_limit_sell_order, symbol, position["amount"], best_ask, {'timeInForce': 'FOK'})
+                if sell_order:
+                    profit = (best_ask - position["buy_price"]) * position["amount"]
+                    total_profit += profit
+                    executed_trades += 1
+                    logger.info(f"Prodej {position['amount']:.2f} USDC za {best_ask} → Zisk: {profit:.2f} USDT")
+                    closed_positions.append(position)
+            
+            open_positions = [pos for pos in open_positions if pos not in closed_positions]
+            logger.info(f"Celkový zisk: {total_profit:.2f} USDT | Počet obchodů: {executed_trades}")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Neočekávaná chyba: {e}")
+            await asyncio.sleep(5)
+
+# 🚀 Spuštění
+if __name__ == "__main__":
+    try:
+        asyncio.run(execute_strategy())
+    except KeyboardInterrupt:
+        print("Program ukončen uživatelem.")
+        asyncio.run(exchange.close())
